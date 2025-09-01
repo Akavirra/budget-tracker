@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Мій бюджет-трекер</title>
+    <title>Мій бюджет-трекер з синхронізацією</title>
     <style>
         * {
             margin: 0;
@@ -27,6 +27,33 @@
             text-align: center;
             color: white;
             margin-bottom: 30px;
+        }
+        
+        .sync-status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            color: white;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        .sync-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        
+        .sync-indicator.offline {
+            background: #ef4444;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
         
         .stats-grid {
@@ -129,6 +156,11 @@
             box-shadow: 0 10px 25px rgba(59, 130, 246, 0.3);
         }
         
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
         .transactions {
             grid-column: 1 / -1;
         }
@@ -224,6 +256,12 @@
             min-width: 200px;
         }
         
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+        
         @media (max-width: 768px) {
             .main-content {
                 grid-template-columns: 1fr;
@@ -243,7 +281,12 @@
     <div class="container">
         <div class="header">
             <h1>💰 Мій особистий бюджет</h1>
-            <p>Контроль доходів, витрат та кредитів</p>
+            <p>Контроль доходів, витрат та кредитів з синхронізацією</p>
+        </div>
+        
+        <div class="sync-status">
+            <div class="sync-indicator" id="syncIndicator"></div>
+            <span id="syncStatus">Синхронізація...</span>
         </div>
         
         <div class="month-selector">
@@ -300,14 +343,12 @@
                         <label>Категорія</label>
                         <select id="category" required>
                             <option value="">Оберіть категорію</option>
-                            <!-- Доходи -->
                             <optgroup label="Доходи">
                                 <option value="salary">Зарплата</option>
                                 <option value="freelance">Фріланс</option>
                                 <option value="investment">Інвестиції</option>
                                 <option value="other-income">Інше</option>
                             </optgroup>
-                            <!-- Витрати -->
                             <optgroup label="Витрати">
                                 <option value="food">Продукти</option>
                                 <option value="transport">Транспорт</option>
@@ -318,7 +359,6 @@
                                 <option value="education">Освіта</option>
                                 <option value="other-expense">Інше</option>
                             </optgroup>
-                            <!-- Кредити -->
                             <optgroup label="Кредити">
                                 <option value="mortgage">Іпотека</option>
                                 <option value="car-loan">Авто кредит</option>
@@ -337,21 +377,44 @@
                         </select>
                     </div>
                     
-                    <button type="submit" class="btn">Додати транзакцію</button>
+                    <button type="submit" class="btn" id="submitBtn">Додати транзакцію</button>
                 </form>
             </div>
         </div>
         
         <div class="section transactions">
             <h3>📊 Історія транзакцій</h3>
-            <div id="transactionsList"></div>
+            <div id="transactionsList">
+                <div class="loading">Завантаження транзакцій...</div>
+            </div>
         </div>
     </div>
 
-    <script>
-        let transactions = {};
+    <!-- Firebase SDKs -->
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        // Firebase configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyCtL7avXo8Hs8iPFcVpPuMa6iKS_VemMsY",
+            authDomain: "budget-tracker-sync-da3af.firebaseapp.com",
+            projectId: "budget-tracker-sync-da3af",
+            storageBucket: "budget-tracker-sync-da3af.firebasestorage.app",
+            messagingSenderId: "35958491772",
+            appId: "1:35958491772:web:4b37e304169734bcf457f9"
+        };
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // Global variables
         let currentDate = new Date();
-        
+        let transactions = {};
+        let isOnline = navigator.onLine;
+
         const monthNames = [
             'Січень', 'Лютий', 'Березень', 'Квітень', 'Травень', 'Червень',
             'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень'
@@ -375,7 +438,8 @@
             'personal-loan': 'Особистий кредит',
             'credit-card': 'Кредитка'
         };
-        
+
+        // Utility functions
         function getCurrentMonthKey() {
             return `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`;
         }
@@ -388,20 +452,29 @@
         function changeMonth(direction) {
             currentDate.setMonth(currentDate.getMonth() + direction);
             updateMonthDisplay();
-            updateDisplay();
+            loadTransactions();
         }
         
         function formatNumber(num) {
             return new Intl.NumberFormat('uk-UA').format(Math.abs(num));
         }
-        
-        function getCurrentTransactions() {
-            const monthKey = getCurrentMonthKey();
-            return transactions[monthKey] || [];
+
+        function updateSyncStatus() {
+            const indicator = document.getElementById('syncIndicator');
+            const status = document.getElementById('syncStatus');
+            
+            if (isOnline) {
+                indicator.classList.remove('offline');
+                status.textContent = 'Синхронізовано';
+            } else {
+                indicator.classList.add('offline');
+                status.textContent = 'Офлайн';
+            }
         }
-        
+
         function updateDisplay() {
-            const monthTransactions = getCurrentTransactions();
+            const monthKey = getCurrentMonthKey();
+            const monthTransactions = transactions[monthKey] || [];
             
             let totalIncome = 0;
             let totalExpenses = 0;
@@ -431,7 +504,8 @@
         }
         
         function displayTransactions() {
-            const monthTransactions = getCurrentTransactions();
+            const monthKey = getCurrentMonthKey();
+            const monthTransactions = transactions[monthKey] || [];
             const transactionsList = document.getElementById('transactionsList');
             
             if (monthTransactions.length === 0) {
@@ -439,8 +513,10 @@
                 return;
             }
             
-            // Сортуємо по даті додавання (найновіші спочатку)
-            const sortedTransactions = [...monthTransactions].reverse();
+            // Сортуємо по даті (найновіші спочатку)
+            const sortedTransactions = [...monthTransactions].sort((a, b) => 
+                new Date(b.date) - new Date(a.date)
+            );
             
             transactionsList.innerHTML = sortedTransactions.map((transaction, index) => `
                 <div class="transaction-item transaction-${transaction.type}">
@@ -453,19 +529,106 @@
                     <div class="transaction-amount ${transaction.type === 'income' ? 'income' : transaction.type === 'expense' ? 'expense' : 'credit'}">
                         ${transaction.type === 'income' ? '+' : '-'}${formatNumber(transaction.amount)} ₴
                     </div>
-                    <button class="delete-btn" onclick="deleteTransaction(${monthTransactions.length - 1 - index})">×</button>
+                    <button class="delete-btn" onclick="deleteTransaction('${transaction.id}')">×</button>
                 </div>
             `).join('');
         }
-        
-        function deleteTransaction(index) {
-            const monthKey = getCurrentMonthKey();
-            if (!transactions[monthKey]) return;
-            
-            transactions[monthKey].splice(index, 1);
-            updateDisplay();
+
+        // Firebase operations
+        async function loadTransactions() {
+            try {
+                const monthKey = getCurrentMonthKey();
+                const q = query(
+                    collection(db, "transactions"), 
+                    orderBy("date", "desc")
+                );
+                
+                const querySnapshot = await getDocs(q);
+                const allTransactions = {};
+                
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const transactionMonth = data.month;
+                    
+                    if (!allTransactions[transactionMonth]) {
+                        allTransactions[transactionMonth] = [];
+                    }
+                    
+                    allTransactions[transactionMonth].push({
+                        id: doc.id,
+                        ...data
+                    });
+                });
+                
+                transactions = allTransactions;
+                updateDisplay();
+                updateSyncStatus();
+            } catch (error) {
+                console.error("Помилка завантаження транзакцій:", error);
+                document.getElementById('transactionsList').innerHTML = 
+                    '<p style="text-align: center; color: #ef4444; padding: 40px;">Помилка завантаження даних</p>';
+            }
         }
-        
+
+        async function addTransaction(transactionData) {
+            try {
+                const submitBtn = document.getElementById('submitBtn');
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Додавання...';
+                
+                const docRef = await addDoc(collection(db, "transactions"), {
+                    ...transactionData,
+                    date: new Date().toISOString(),
+                    month: getCurrentMonthKey()
+                });
+                
+                console.log("Транзакція додана з ID: ", docRef.id);
+                
+                // Оновлюємо локальні дані
+                const monthKey = getCurrentMonthKey();
+                if (!transactions[monthKey]) {
+                    transactions[monthKey] = [];
+                }
+                
+                transactions[monthKey].unshift({
+                    id: docRef.id,
+                    ...transactionData,
+                    date: new Date().toISOString(),
+                    month: monthKey
+                });
+                
+                updateDisplay();
+                
+            } catch (error) {
+                console.error("Помилка додавання транзакції:", error);
+                alert('Помилка додавання транзакції. Спробуйте ще раз.');
+            } finally {
+                const submitBtn = document.getElementById('submitBtn');
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Додати транзакцію';
+            }
+        }
+
+        async function deleteTransaction(transactionId) {
+            if (!confirm('Видалити цю транзакцію?')) return;
+            
+            try {
+                await deleteDoc(doc(db, "transactions", transactionId));
+                
+                // Видаляємо з локальних даних
+                Object.keys(transactions).forEach(monthKey => {
+                    transactions[monthKey] = transactions[monthKey].filter(t => t.id !== transactionId);
+                });
+                
+                updateDisplay();
+                console.log("Транзакцію видалено");
+            } catch (error) {
+                console.error("Помилка видалення транзакції:", error);
+                alert('Помилка видалення транзакції.');
+            }
+        }
+
+        // Event listeners
         document.getElementById('transactionForm').addEventListener('submit', function(e) {
             e.preventDefault();
             
@@ -475,29 +638,61 @@
             const category = document.getElementById('category').value;
             const paymentMethod = document.getElementById('paymentMethod').value;
             
-            const monthKey = getCurrentMonthKey();
-            if (!transactions[monthKey]) {
-                transactions[monthKey] = [];
-            }
-            
-            transactions[monthKey].push({
+            const transactionData = {
                 type,
                 amount,
                 description,
                 category,
-                paymentMethod,
-                date: new Date().toISOString()
+                paymentMethod
+            };
+            
+            addTransaction(transactionData);
+            this.reset();
+        });
+
+        // Network status
+        window.addEventListener('online', () => {
+            isOnline = true;
+            updateSyncStatus();
+            loadTransactions();
+        });
+
+        window.addEventListener('offline', () => {
+            isOnline = false;
+            updateSyncStatus();
+        });
+
+        // Make functions global for onclick handlers
+        window.changeMonth = changeMonth;
+        window.deleteTransaction = deleteTransaction;
+
+        // Initialize app
+        updateMonthDisplay();
+        updateSyncStatus();
+        loadTransactions();
+
+        // Real-time listener for transactions
+        const q = query(collection(db, "transactions"), orderBy("date", "desc"));
+        onSnapshot(q, (querySnapshot) => {
+            const allTransactions = {};
+            
+            querySnapshot.forEach((doc) => {
+                const data = doc.data();
+                const transactionMonth = data.month;
+                
+                if (!allTransactions[transactionMonth]) {
+                    allTransactions[transactionMonth] = [];
+                }
+                
+                allTransactions[transactionMonth].push({
+                    id: doc.id,
+                    ...data
+                });
             });
             
-            // Очищаємо форму
-            this.reset();
-            
+            transactions = allTransactions;
             updateDisplay();
         });
-        
-        // Ініціалізація
-        updateMonthDisplay();
-        updateDisplay();
     </script>
 </body>
 </html>
